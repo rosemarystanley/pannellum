@@ -67,11 +67,13 @@ var config,
     externalEventListeners = {},
     specifiedPhotoSphereExcludes = [],
     update = false, // Should we update when still to render dynamic content
+    eps = 1e-6,
     hotspotsCreated = false;
 
 var defaultConfig = {
     hfov: 100,
     minHfov: 50,
+    multiResMinHfov: false,
     maxHfov: 120,
     pitch: 0,
     minPitch: undefined,
@@ -90,6 +92,7 @@ var defaultConfig = {
     northOffset: 0,
     showFullscreenCtrl: true,
     dynamic: false,
+    dynamicUpdate: false,
     doubleClickZoom: true,
     keyboardZoom: true,
     mouseZoom: true,
@@ -106,6 +109,7 @@ var defaultConfig = {
     crossOrigin: 'anonymous',
     touchPanSpeedCoeffFactor: 1,
     capturedKeyNumbers: [16, 17, 27, 37, 38, 39, 40, 61, 65, 68, 83, 87, 107, 109, 173, 187, 189],
+    friction: 0.15
 };
 
 // Translatable / configurable strings
@@ -657,8 +661,9 @@ function aboutMessage(event) {
 function mousePosition(event) {
     var bounds = container.getBoundingClientRect();
     var pos = {};
-    pos.x = event.clientX - bounds.left;
-    pos.y = event.clientY - bounds.top;
+    // pageX / pageY needed for iOS
+    pos.x = (event.clientX || event.pageX) - bounds.left;
+    pos.y = (event.clientY || event.pageY) - bounds.top;
     return pos;
 }
 
@@ -999,7 +1004,6 @@ function onDocumentMouseWheel(event) {
         setHfov(config.hfov + event.detail * 1.5);
         speed.hfov = event.detail > 0 ? 1 : -1;
     }
-    
     animateInit();
 }
 
@@ -1245,19 +1249,19 @@ function keyRepeat() {
     // "Inertia"
     if (diff > 0 && !config.autoRotate) {
         // "Friction"
-        var friction = 0.85;
-        
+        var slowDownFactor = 1 - config.friction;
+
         // Yaw
         if (!keysDown[4] && !keysDown[5] && !keysDown[8] && !keysDown[9] && !animatedMove.yaw) {
-            config.yaw += speed.yaw * diff * friction;
+            config.yaw += speed.yaw * diff * slowDownFactor;
         }
         // Pitch
         if (!keysDown[2] && !keysDown[3] && !keysDown[6] && !keysDown[7] && !animatedMove.pitch) {
-            config.pitch += speed.pitch * diff * friction;
+            config.pitch += speed.pitch * diff * slowDownFactor;
         }
         // Zoom
         if (!keysDown[0] && !keysDown[1] && !animatedMove.hfov) {
-            setHfov(config.hfov + speed.hfov * diff * friction);
+            setHfov(config.hfov + speed.hfov * diff * slowDownFactor);
         }
     }
 
@@ -1300,11 +1304,7 @@ function animateMove(axis) {
         t.endPosition === t.startPosition) {
         result = t.endPosition;
         speed[axis] = 0;
-        var callback = animatedMove[axis].callback,
-            callbackArgs = animatedMove[axis].callbackArgs;
         delete animatedMove[axis];
-        if (typeof callback == 'function')
-            callback(callbackArgs);
     }
     config[axis] = result;
 }
@@ -1372,6 +1372,7 @@ function animate() {
     } else if (renderer && (renderer.isLoading() || (config.dynamic === true && update))) {
         requestAnimationFrame(animate);
     } else {
+        fireEvent('animatefinished', {pitch: _this.getPitch(), yaw: _this.getYaw(), hfov: _this.getHfov()});
         animating = false;
         prevTime = undefined;
         var autoRotateStartTime = config.autoRotateInactivityDelay -
@@ -1707,7 +1708,13 @@ function createHotSpot(hs) {
     } else if (hs.URL) {
         a = document.createElement('a');
         a.href = sanitizeURL(hs.URL);
-        a.target = '_blank';
+        if (hs.attributes) {
+            for (var key in hs.attributes) {
+                a.setAttribute(key, hs.attributes[key]);
+            }
+        } else {
+            a.target = '_blank';
+        }
         renderContainer.appendChild(a);
         div.className += ' pnlm-pointer';
         span.className += ' pnlm-pointer';
@@ -2106,7 +2113,7 @@ function onFullScreenChange() {
         controls.fullscreen.classList.remove('pnlm-fullscreen-toggle-button-active');
         fullscreenActive = false;
     }
-
+    fireEvent('fullscreenchange', fullscreenActive);
     // Resize renderer (deal with browser quirks and fixes #155)
     renderer.resize();
     setHfov(config.hfov);
@@ -2144,7 +2151,7 @@ function zoomOut() {
 function constrainHfov(hfov) {
     // Keep field of view within bounds
     var minHfov = config.minHfov;
-    if (config.type == 'multires' && renderer) {
+    if (config.type == 'multires' && renderer && config.multiResMinHfov) {
         minHfov = Math.min(minHfov, renderer.getCanvas().width / (config.multiRes.cubeResolution / 90 * 0.9));
     }
     if (minHfov > config.maxHfov) {
@@ -2178,6 +2185,7 @@ function constrainHfov(hfov) {
  */
 function setHfov(hfov) {
     config.hfov = constrainHfov(hfov);
+    fireEvent('zoomchange', config.hfov);
 }
 
 /**
@@ -2280,6 +2288,13 @@ function loadScene(sceneId, targetPitch, targetYaw, targetHfov, fadeDone) {
     }
     fireEvent('scenechange', sceneId);
     load();
+
+    // Properly handle switching to dynamic scenes
+    update = config.dynamicUpdate === true;
+    if (config.dynamic) {
+        panoImage = config.panorama;
+        onImageLoad();
+    }
 }
 
 /**
@@ -2379,16 +2394,22 @@ this.getPitch = function() {
  * @returns {Viewer} `this`
  */
 this.setPitch = function(pitch, animated, callback, callbackArgs) {
+    latestInteraction = Date.now();
+    if (Math.abs(pitch - config.pitch) <= eps) {
+        if (typeof callback == 'function')
+            callback(callbackArgs);
+        return this;
+    }
     animated = animated == undefined ? 1000: Number(animated);
     if (animated) {
         animatedMove.pitch = {
             'startTime': Date.now(),
             'startPosition': config.pitch,
             'endPosition': pitch,
-            'duration': animated,
-            'callback': callback,
-            'callbackArgs': callbackArgs
+            'duration': animated
         }
+        if (typeof callback == 'function')
+            setTimeout(function(){callback(callbackArgs)}, animated);
     } else {
         config.pitch = pitch;
     }
@@ -2440,6 +2461,12 @@ this.getYaw = function() {
  * @returns {Viewer} `this`
  */
 this.setYaw = function(yaw, animated, callback, callbackArgs) {
+    latestInteraction = Date.now();
+    if (Math.abs(yaw - config.yaw) <= eps) {
+        if (typeof callback == 'function')
+            callback(callbackArgs);
+        return this;
+    }
     animated = animated == undefined ? 1000: Number(animated);
     yaw = ((yaw + 180) % 360) - 180 // Keep in bounds
     if (animated) {
@@ -2453,10 +2480,10 @@ this.setYaw = function(yaw, animated, callback, callbackArgs) {
             'startTime': Date.now(),
             'startPosition': config.yaw,
             'endPosition': yaw,
-            'duration': animated,
-            'callback': callback,
-            'callbackArgs': callbackArgs
+            'duration': animated
         }
+        if (typeof callback == 'function')
+            setTimeout(function(){callback(callbackArgs)}, animated);
     } else {
         config.yaw = yaw;
     }
@@ -2508,16 +2535,22 @@ this.getHfov = function() {
  * @returns {Viewer} `this`
  */
 this.setHfov = function(hfov, animated, callback, callbackArgs) {
+    latestInteraction = Date.now();
+    if (Math.abs(hfov - config.hfov) <= eps) {
+        if (typeof callback == 'function')
+            callback(callbackArgs);
+        return this;
+    }
     animated = animated == undefined ? 1000: Number(animated);
     if (animated) {
         animatedMove.hfov = {
             'startTime': Date.now(),
             'startPosition': config.hfov,
             'endPosition': constrainHfov(hfov),
-            'duration': animated,
-            'callback': callback,
-            'callbackArgs': callbackArgs
+            'duration': animated
         }
+        if (typeof callback == 'function')
+            setTimeout(function(){callback(callbackArgs)}, animated);
     } else {
         setHfov(hfov);
     }
@@ -2563,16 +2596,20 @@ this.setHfovBounds = function(bounds) {
  */
 this.lookAt = function(pitch, yaw, hfov, animated, callback, callbackArgs) {
     animated = animated == undefined ? 1000: Number(animated);
-    if (pitch !== undefined) {
+    if (pitch !== undefined && Math.abs(pitch - config.pitch) > eps) {
         this.setPitch(pitch, animated, callback, callbackArgs);
         callback = undefined;
     }
-    if (yaw !== undefined) {
+    if (yaw !== undefined && Math.abs(yaw - config.yaw) > eps) {
         this.setYaw(yaw, animated, callback, callbackArgs);
         callback = undefined;
     }
-    if (hfov !== undefined)
+    if (hfov !== undefined && Math.abs(hfov - config.hfov) > eps) {
         this.setHfov(hfov, animated, callback, callbackArgs);
+        callback = undefined;
+    }
+    if (typeof callback == 'function')
+        callback(callbackArgs);
     return this;
 }
 
@@ -2674,6 +2711,16 @@ this.stopAutoRotate = function() {
     config.autoRotateInactivityDelay = -1;
     return this;
 };
+
+/**
+ * Stops all movement.
+ * @memberof Viewer
+ * @instance
+ */
+this.stopMovement = function() {
+    stopAnimation();
+    speed = {'yaw': 0, 'pitch': 0, 'hfov': 0};
+}
 
 /**
  * Returns the panorama renderer.
